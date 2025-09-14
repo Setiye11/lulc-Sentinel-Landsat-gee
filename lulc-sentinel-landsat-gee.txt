@@ -1,0 +1,366 @@
+Full GEE scripts for both Landsat-8 and Sentinel Imagery 
+   
+ Pan sharpening, resampling, NDVI and classification of Landsat 8 image
+
+Step (1) Define AOI (Study Area)
+
+Map.centerObject(Study Area, 10);
+Map.addLayer(Study Area, {}, 'Study Area Boundary');
+
+Step (2) Cloud and Shadow Masking Functions
+// Function to mask clouds and shadows
+function maskCloudsAndShadows(image) {
+  // Bits 3 and 4 are cloud and cloud shadow, respectively
+  var cloudShadowBitMask = (1 << 4);
+  var cloudsBitMask = (1 << 3);
+  
+  // Get the QA band
+  var qa = image.select('QA_PIXEL');
+  
+  // Both flags should be set to zero, indicating clear conditions
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+               .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  
+  // Apply the mask and copy properties
+  return image.updateMask(mask).copyProperties(image, ['system:time_start']);
+}
+
+Step (3) Load and Filter Landsat 8 TOA Image
+
+var image = ee.ImageCollection("LANDSAT/LC08/C02/T1_TOA")
+  .filterBounds(Study Area)
+  .filterDate('YY-MM-DD', 'YY-MM-DD')
+  .filterMetadata('CLOUD_COVER', 'less_than', 10)  
+  .map(maskCloudsAndShadows)  
+  .sort('CLOUD_COVER')
+  .first();
+
+print('Selected Image:', image);
+Map.addLayer(image, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, 'Original RGB');
+
+Step (4) Select RGB + Panchromatic + NIR Bands
+
+var rgb = image.select(['B4', 'B3', 'B2']); // R, G, B
+var nir = image.select('B5'); // NIR
+var pan = image.select('B8'); // Panchromatic (15m)
+
+Step (5) Brovey Pan sharpening
+
+// Improved Brovey transform implementation
+var sum = rgb.add(1e-10).reduce(ee.Reducer.sum()); 
+var brovey = rgb.divide(sum).multiply(pan).rename(['B4', 'B3', 'B2']);
+
+Step (6) Resample to 10m and Clip
+
+var brovey10m = brovey
+  .resample('bilinear')
+  .reproject({
+    crs: 'EPSG:32637', // UTM Zone 37N
+    scale: 10
+  })
+  .clip(Study Area);
+
+// Resample NIR band for NDVI (to 10m)
+var nir10m = nir
+  .resample('bilinear')
+  .reproject({
+    crs: 'EPSG:32637',
+    scale: 10
+  })
+  .clip(Study Area);
+
+Step (7) Compute NDVI from Resampled Image
+
+var red = brovey10m.select('B4');
+var ndvi = nir10m.subtract(red).divide(nir10m.add(red)).rename('NDVI');
+
+// Visualization
+Map.addLayer(brovey10m, {min: 0, max: 0.3, bands: ['B4', 'B3', 'B2']}, 'Pansharpened RGB (10m)');
+Map.addLayer(ndvi, {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI (10m)');
+
+Step (7) Load and Merge Training Data
+
+var classes = A1
+  .merge(B1)
+  .merge(W1)
+  .merge(F1)
+  .merge(W5)
+  .merge(B6);
+ 
+
+Map.addLayer(classes, {}, 'Training Data');
+
+Step (8) Sample the Image Using Training Data
+
+var training = brovey10m.sampleRegions({
+  collection: classes,
+  properties: ['lc'],
+  scale: 10,
+  tileScale: 2
+});
+
+print('Training Samples:', training.limit(5));
+
+Step (9) Split into Training and Testing Sets
+
+var withRandom = training.randomColumn('random');
+var split = 0.8;
+var trainingSet = withRandom.filter(ee.Filter.lt('random', split));
+var testingSet = withRandom.filter(ee.Filter.gte('random', split));
+
+Step (10) Train Random Forest Classifier
+
+var classifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainingSet,
+  classProperty: 'lc',
+  inputProperties: brovey10m.bandNames()
+});
+
+Step (11) Classify the Image
+
+var classified = brovey10m.classify(classifier);
+
+Step (12) Accuracy Assessment
+
+var validated = testingSet.classify(classifier);
+var errorMatrix = validated.errorMatrix('lc', 'classification');
+
+print('Confusion Matrix:', errorMatrix)
+print('Overall Accuracy:', errorMatrix.accuracy())
+print('Kappa:', errorMatrix.kappa())
+print("Producer's Accuracy:", errorMatrix.producersAccuracy())
+print("User's Accuracy:", errorMatrix.consumersAccuracy())
+
+Step (13) Visualization
+
+Map.addLayer(brovey10m, {min: 0, max: 0.3}, 'Natural Color (10m)');
+Map.addLayer(ndvi, {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI (10m)');
+Map.addLayer(classified, {
+  min: 0,
+  max: 5,
+  palette: ['green', 'red', 'blue', 'yellow', 'gray', 'darkgreen']
+}, 'RF Classified Image');
+
+// ----------------------------
+Step (14) Export NDVI and Brovey Natural Color
+
+Export.image.toDrive({
+  image: ndvi,
+  description: 'NDVI_10m_ Study Area',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'NDVI_10m_ Study Area',
+  region: Study Area.geometry(),
+  scale: 10,
+  crs: 'EPSG:32637',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: brovey10m,
+  description: 'NaturalColor_Brovey_10m',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'Brovey_NaturalColor_10m',
+  region: Study Area.geometry(),
+  scale: 10,
+  crs: 'EPSG:32637',
+  maxPixels: 1e13
+});
+
+Export the Classified Image
+Export.image.toDrive({
+image: classified,
+description: 'L8_RF_Classification',
+folder: 'GEE_Exports',
+fileNamePrefix: 'rf_classified_studyarea',
+region: Study Area.geometry(),
+scale: 10,
+crs: 'EPSG:32637',
+maxPixels: 1e13
+});
+
+Steps and Code for Normalized Difference vegetation index (NDVI) in sentinel 2 imagery 
+
+Step (1) Import and set the region of interest
+
+Map.addLayer(AOI);
+
+Step (2) Function to mask clouds using the Sentinel-2 QA band
+ //Function to Mask Clouds:
+
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+Step (3) Filter Sentinel-2 Image Collection:
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_HARMONIZED');
+var rgbVis = {min: 0.0, max: 3000, bands: ['B4', 'B3', 'B2']};
+
+var filtered = s2.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+  .filter(ee.Filter.date('YY-MM-DD', 'YY-MM-DD'))
+  .filter(ee.Filter.bounds(AOI));
+
+var composite = filtered.median().clip(AOI);
+Map.addLayer(composite, rgbVis, 'AOI');
+
+Step (4) Compute NDVI:
+
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  return image.addBands(ndvi);
+}
+
+var withNdvi = filtered.map(addNDVI);
+var composite = withNdvi.median();
+var ndviComposite = composite.select('ndvi');
+
+var palette = [
+  'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+  '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+  '004C00', '023B01', '012E01', '011D01', '011301'];
+
+var ndviVis = {min:0, max:0.9, palette: palette };
+Map.addLayer(ndviComposite.clip(AOI), ndviVis, 'ndvi');
+ 
+Step (6) Export NDVI composites to Google Drive:
+
+Export.image.toDrive({
+    image: ndviComposite,
+    description: 'AOI_2016',
+    folder: 'AOI_index',
+    fileNamePrefix: 'AOI_YY_NDVI',
+    region: AOI,
+    scale: 10,
+    maxPixels: 1e9
+});
+Steps and Java scripts code for Land use/cover change in GEE 
+
+Step (1) Import the AOI shapefile or Featurecollection
+
+Map.addLayer(AOI, {}, 'AOI');
+
+Step (2) Function to mask clouds using the Sentinel-2 QA band
+
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+Step (3) Load Sentinel 2A image and select specific bands
+
+var image = ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+  .filterDate('YY-MM-YY', 'YY-MM-DD')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+  .filterBounds(AOI)
+  .select(['B2', 'B3', 'B4', 'B8']) // Select specific bands
+  .median()
+  .clip(AOI); // Clip the image to the study area
+
+var visParamsTrue = {bands: ['B4', 'B3', 'B2'], min: 0, max: 2500, gamma: 1.1};
+Map.addLayer(image, visParamsTrue, "Sentinel YY");
+Map.centerObject(AOI, 10);
+
+
+Step (4)  Create Training Data
+var training = A1.merge(B1).merge(W1).merge(F1).merge(W5).merge(B6);
+print(training);
+///A1, B1, W1, F1, W5 and B6 are the defined land use class
+
+// Land cover labels and bands
+var label = 'Class';
+var bands = ['B2', 'B3', 'B4', 'B8']; // Bands with 10 meter spatial resolution
+var input = image.select(bands);
+
+// Overlay the points on the imagery to get training data
+var trainImage = input.sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 10
+});
+
+var trainingData = trainImage.randomColumn();
+var trainSet = trainingData.filter(ee.Filter.lessThan('random', 0.8));
+var testSet = trainingData.filter(ee.Filter.greaterThanOrEquals('random', 0.8));
+
+Step (5) Random Forest
+ var classifier = ee.Classifier.smileRandomForest({
+   numberOfTrees: 100, // Set the number of trees to an appropriate value
+   seed: 1
+ }).train({
+   features: trainSet,
+   classProperty: label,
+   inputProperties: bands
+ });
+
+// Classify the image
+var classified = input.classify(classifier);
+print(classified.getInfo());
+
+// Clip the classified image by the ROI (Gubalafto)
+var clippedClassified = classified.clip(Gubalafto);
+
+var landcoverPalette = [
+  'fee6ce', // A1
+  'de2d26', // B1
+  '2ca25f', // W1
+  '636363', // F1
+  '43a2ca', // W5
+  'ece2f0', // B6
+];
+
+Map.addLayer(clippedClassified, {palette: landcoverPalette, min: 0, max: 6}, 'classification');
+
+Step (6) Accuracy Assessment
+var confMatrix = classifier.confusionMatrix();
+print(confMatrix, 'Confusion Matrix');
+
+var OA = confMatrix.accuracy();
+var CA = confMatrix.consumersAccuracy();
+var Kappa = confMatrix.kappa();
+var PA = confMatrix.producersAccuracy();
+
+print('Overall Accuracy:', OA);
+print('Consumers Accuracy:', CA);
+print('Kappa:', Kappa);
+print('Producers Accuracy:', PA);
+
+var testAccuracy = testSet.classify(classifier)
+  .errorMatrix({
+    actual: 'Class', 
+    predicted: 'classification'
+  });
+
+print('Test error matrix: ', testAccuracy);
+print('Test overall accuracy: ', testAccuracy.accuracy());
+print('Test Kappa: ', testAccuracy.kappa());
+print('Test consumersAccuracy: ', testAccuracy.consumersAccuracy());
+print('Test producersAccuracy: ', testAccuracy.producersAccuracy());
+
+Step (7) Export the clipped classified image to Google Drive
+Export.image.toDrive({
+  image: clippedClassified,
+  description: 'Sentinel_2_Classified_RF_YY',
+ scale: 10,
+  region: AOI,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326', // Added CRS for compatibility
+  formatOptions: {
+   cloudOptimized: true // Ensure the image is cloud-optimized
+  }
+});
+
+
